@@ -33,8 +33,8 @@ from medicalseg.cvlibs import manager
 from medicalseg.utils import utils
 from medicalseg.cvlibs import param_init
 from medicalseg.models import layers
-
 from tools.preprocess_utils import experiment_planner
+from medicalseg.models.att import AxialAttention
 
 
 @manager.MODELS.add_component
@@ -344,6 +344,8 @@ class Generic_UNet(nn.Layer):
         self.pool_layers = []
         self.upsample_ops = []
         self.seg_heads = []
+        self.axial_attention = []
+        self.axial_attention2 = []
 
         output_features = base_num_features
         input_features = input_channels
@@ -372,6 +374,16 @@ class Generic_UNet(nn.Layer):
                     self.nonlin_kwargs,
                     first_stride,
                     basic_block=basic_block))
+
+            #构建编码每一阶段的注意力，主要的参数为 输入通道 output_features与heads数量，
+            # 要求：output_features是heads倍数，这里随便数以8得到heads
+            self.axial_attention.append(AxialAttention(dim = output_features,
+                                                        heads = output_features // 8,
+                                                        dim_heads = 32 * 2 ** (num_pool - d - 1),
+                                                        dim_index = 1,
+                                                        num_dimensions = 3,
+                                                        sum_axial_out = False))
+
             if not self.convolutional_pooling:
                 self.pool_layers.append(pool_op(pool_op_kernel_sizes[d]))
             input_features = output_features
@@ -480,6 +492,14 @@ class Generic_UNet(nn.Layer):
                         self.nonlin,
                         self.nonlin_kwargs,
                         basic_block=basic_block)))
+            # 构建解码每一阶段的注意力，主要的参数为 输入通道 output_features与heads数量，
+            # 要求：output_features是heads倍数，这里随便数以8得到heads
+            self.axial_attention2.append(AxialAttention(dim=nfeatures_from_skip,
+                                                       heads=nfeatures_from_skip // 32,
+                                                       dim_heads=8* 2 ** (num_pool - u - 1),
+                                                       dim_index=1,
+                                                       num_dimensions=3,
+                                                       sum_axial_out=False))
 
         for ds in range(len(self.conv_blocks_localization)):
             self.seg_heads.append(
@@ -513,22 +533,33 @@ class Generic_UNet(nn.Layer):
         self.seg_heads = nn.LayerList(self.seg_heads)
         if self.upscale_logits:
             self.upscale_logits_ops = nn.LayerList(self.upscale_logits_ops)
+        #用于编码部分
+        self.axial_attention = nn.LayerList(self.axial_attention)
+        #用于解码部分
+        self.axial_attention2 = nn.LayerList(self.axial_attention2)
 
     def forward(self, x):
         skips = []
         outputs = []
         for d in range(len(self.conv_blocks_context) - 1):
             x = self.conv_blocks_context[d](x)
+            #这里加入注意力,解码部分，每次上采样后，拼接前，高维细节信息丰富
+            # x = self.axial_attention[d](x)
             skips.append(x)
             if not self.convolutional_pooling:
                 x = self.pool_layers[d](x)
+                x = self.axial_attention[d](x)
+                print(x.shape)
 
-        x = self.conv_blocks_context[-1](x)
-
+        x = self.conv_blocks_context[-1](x)#[1, 256, 4, 4, 4]
         for u in range(len(self.upsample_ops)):
+            #上采样前
             x = self.upsample_ops[u](x)
+            # # 这里加入注意力,解码部分，每次上采样后，拼接前，高维细节信息丰富
+            x = self.axial_attention2[u](x)
             x = paddle.concat([x, skips[-(u + 1)]], axis=1)
             x = self.conv_blocks_localization[u](x)
+
             outputs.append(self.seg_heads[u](x))
 
         if self._deep_supervision and self.training:
@@ -539,3 +570,17 @@ class Generic_UNet(nn.Layer):
             ]]
         else:
             return [outputs[-1]]
+
+if __name__ == '__main__':
+    '''
+    [1, 32, 32, 32, 32]
+    [1, 64, 16, 16, 16]
+    [1, 128, 8, 8, 8]
+    [1, 256, 4, 4, 4]
+    '''
+    model = Generic_UNet(3,32,2,4,conv_op = nn.Conv3D,
+                         norm_op = nn.InstanceNorm3D,
+                         max_num_features = 256,
+                         dropout_op = nn.Dropout3D).to(paddle.device.get_device())
+    x = paddle.rand((1,3,32,32,32)).cuda()
+    model(x)
